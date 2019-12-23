@@ -129,19 +129,54 @@ static int setup_socket(struct ring *ring, char *netdev) {
 
   return fd;
 }
-
+#define _s(x)                                                                  \
+  { x, #x }
+static struct {
+  int value;
+  const char *string;
+} tpkt_status[] = {_s(TP_STATUS_USER),
+                   _s(TP_STATUS_COPY),
+                   _s(TP_STATUS_LOSING),
+                   _s(TP_STATUS_CSUMNOTREADY),
+                   _s(TP_STATUS_VLAN_VALID),
+                   _s(TP_STATUS_BLK_TMO),
+                   _s(TP_STATUS_VLAN_TPID_VALID),
+                   _s(TP_STATUS_CSUM_VALID),
+                   _s(TP_STATUS_TS_SOFTWARE),
+                   _s(TP_STATUS_TS_SYS_HARDWARE),
+                   _s(TP_STATUS_TS_RAW_HARDWARE),
+                   {0}};
+#undef _s
+void print_stat(int s) {
+  int i = 0;
+  while (tpkt_status[i].value) {
+    if (s & tpkt_status[i].value) {
+      printf("%s ", tpkt_status[i].string);
+    }
+    i++;
+  }
+}
 void display(struct tpacket3_hdr *ppd) {
   struct ethhdr *eth = (struct ethhdr *)((uint8_t *)ppd + ppd->tp_mac);
   struct iphdr *ip = (struct iphdr *)((uint8_t *)eth + ETH_HLEN);
 
+  printf("eth_proto: %04x \n", htons(eth->h_proto));
   if (eth->h_proto == htons(ETH_P_IP)) {
     char sbuff[NI_MAXHOST], dbuff[NI_MAXHOST];
     inet_ntop(AF_INET, &ip->saddr, sbuff, sizeof(sbuff));
     inet_ntop(AF_INET, &ip->daddr, dbuff, sizeof(sbuff));
-    fprintf(stderr, "%s -> %s, ", sbuff, dbuff);
+    printf("%s -> %s\n", sbuff, dbuff);
   }
 
-  fprintf(stderr, "rxhash: 0x%x\n", ppd->hv1.tp_rxhash);
+  printf("tp_status: 0x%08x ", ppd->tp_status);
+  print_stat(ppd->tp_status);
+  puts("");
+  printf("tp_len: %u\n", ppd->tp_len);
+  printf("tp_snaplen: %u\n", ppd->tp_snaplen);
+  printf("tp_rxhash: 0x%08x\n", ppd->hv1.tp_rxhash);
+  printf("tp_vlan_tci: %u\n", ppd->hv1.tp_vlan_tci);
+  printf("tp_vlan_tpid: %u\n", ppd->hv1.tp_vlan_tpid);
+  printf("==========================\n");
 }
 
 #define PCAP_HEADER_MAGIC 0xa1b2c3d4
@@ -296,23 +331,29 @@ static void stat_cb(EV_P_ ev_timer *w, int revents) {
   fd = *(int *)w->data;
   len = sizeof(stats);
   err = getsockopt(fd, SOL_PACKET, PACKET_STATISTICS, &stats, &len);
+  char *eol = "\n";
   if (err < 0) {
     perror("getsockopt");
     exit(1);
   }
 
+  // if (isatty(STDERR_FILENO)) {
+  //   fprintf(stderr, "\r\033[K");
+  //   eol = "";
+  // }
   uint64_t x = bytes_total - bytes_last;
   double spd = x * 8 / 1024 / 1024 / 1024.0;
   double bufutil = (blklen * 100.0) / (blks * RING_BLOCK_SZ);
   fprintf(stderr,
-          "Received %u packets (%lu total),"
-          " %lu bytes %lf Gbps (%lu total), %u dropped, freeze_q_cnt: %u, "
-          "blks: %d , buffer util: %lf%%\n",
+          "Dumping: %u pps (%lu total), "
+          " %lu Bps / %.2lf Gbps (%lu total), %u dropped, freeze_q_cnt: %u, "
+          "Buffer: %d blocks/s , util: %.2lf%% %s",
           stats.tp_packets, packets_total, x, spd, bytes_total, stats.tp_drops,
-          stats.tp_freeze_q_cnt, blks, bufutil);
+          stats.tp_freeze_q_cnt, blks, bufutil, eol);
   bytes_last = bytes_total;
   blklen = blks = 0;
-  // syncfs(of);
+  if (loop && sigint)
+    ev_break(EV_A_ EVBREAK_ALL);
 }
 
 int main(int argc, char **argp) {
@@ -342,7 +383,7 @@ int main(int argc, char **argp) {
   signal(SIGINT, sighandler);
   ev_run(loop, 0);
 
-  stat_cb(loop, &timer_stat, 0);
+  stat_cb(NULL, &timer_stat, 0);
   save_close();
   teardown_socket(&ring, fd);
   return 0;
