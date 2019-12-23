@@ -1,6 +1,7 @@
 
 #include <arpa/inet.h>
 #include <assert.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
@@ -40,11 +41,14 @@ struct ring {
 
 static uint64_t packets_total = 0, bytes_total = 0;
 
+#define RING_BLOCK_SZ (1 << 22)
+#define RING_FRAME_SZ (1 << 12)
+#define RING_BLOCK_CNT 128
 static int setup_socket(struct ring *ring, char *netdev) {
   int err, i, fd, v = TPACKET_V3;
   struct sockaddr_ll ll;
-  unsigned int blocksiz = 1 << 21, framesiz = 1 << 11;
-  ring->block_cnt = 16;
+  unsigned int blocksiz = RING_BLOCK_SZ, framesiz = RING_FRAME_SZ;
+  ring->block_cnt = RING_BLOCK_CNT;
   ring->block_cur = 0;
   fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
   if (fd < 0) {
@@ -85,13 +89,14 @@ static int setup_socket(struct ring *ring, char *netdev) {
     exit(1);
   }
 
-  printf("block size:%d, %d blocks, %d MB total;"
-         "frame size: %d, %d frame per block, %d frames total\n",
-         ring->req.tp_block_size, ring->req.tp_block_nr,
-         ring->req.tp_block_size * ring->req.tp_block_nr / 1024 / 1024,
-         ring->req.tp_frame_size,
-         ring->req.tp_block_size / ring->req.tp_frame_size,
-         ring->req.tp_frame_nr);
+  fprintf(stderr,
+          "block size:%d, %d blocks, %d MB total;"
+          "frame size: %d, %d frame per block, %d frames total\n",
+          ring->req.tp_block_size, ring->req.tp_block_nr,
+          ring->req.tp_block_size * ring->req.tp_block_nr / 1024 / 1024,
+          ring->req.tp_frame_size,
+          ring->req.tp_block_size / ring->req.tp_frame_size,
+          ring->req.tp_frame_nr);
 
   ring->mmap_ptr = mmap(NULL, ring->req.tp_block_size * ring->req.tp_block_nr,
                         PROT_READ | PROT_WRITE, MAP_SHARED | MAP_LOCKED, fd, 0);
@@ -105,6 +110,7 @@ static int setup_socket(struct ring *ring, char *netdev) {
   for (i = 0; i < ring->req.tp_block_nr; ++i) {
     ring->block_ptr[i] = (void *)ring->mmap_ptr + (i * ring->req.tp_block_size);
     // ring->rd[i].iov_len = ring->req.tp_block_size;
+    // ring->block_ptr[i]->hdr.bh1.block_status = TP_STATUS_KERNEL;
   }
 
   memset(&ll, 0, sizeof(ll));
@@ -132,11 +138,12 @@ void display(struct tpacket3_hdr *ppd) {
     char sbuff[NI_MAXHOST], dbuff[NI_MAXHOST];
     inet_ntop(AF_INET, &ip->saddr, sbuff, sizeof(sbuff));
     inet_ntop(AF_INET, &ip->daddr, dbuff, sizeof(sbuff));
-    printf("%s -> %s, ", sbuff, dbuff);
+    fprintf(stderr, "%s -> %s, ", sbuff, dbuff);
   }
 
-  printf("rxhash: 0x%x\n", ppd->hv1.tp_rxhash);
+  fprintf(stderr, "rxhash: 0x%x\n", ppd->hv1.tp_rxhash);
 }
+
 #define PCAP_HEADER_MAGIC 0xa1b2c3d4
 #define PCAP_HEADER_MAGIC_NS 0xa1b23c4d
 #define PCAP_HEADER_SIZE (sizeof(struct pcap_fhdr))
@@ -160,7 +167,7 @@ struct pcap_phdr {
 } __attribute__((__packed__));
 typedef struct pcap_phdr *pcap_phdr_t;
 
-#define GZOUT
+//#define GZOUT
 #ifdef GZOUT
 #define pcap_file gzFile
 #define pcap_open gzopen
@@ -174,31 +181,59 @@ typedef struct pcap_phdr *pcap_phdr_t;
 #define pcap_flush fflush
 #define pcap_close fclose
 #endif
-static pcap_file of;
+#define SNAPLEN 2048
+#define IO_BLOCK_SZ 4096
+static int of;
+static char *iobuf;
+static off_t iobuf_sz;
+static char *of_name;
 void save_init(char *name) {
-  of = pcap_open(name, "wb");
+  of_name = name;
+  of = open(name, O_CREAT | O_WRONLY | O_TRUNC | O_DIRECT, 0644);
   struct pcap_fhdr hdr = {.magic = PCAP_HEADER_MAGIC_NS,
                           .version_major = 2,
                           .version_minor = 4,
                           .thiszone = 0,
                           .sigfigs = 0,
-                          .snaplen = 2048,
+                          .snaplen = SNAPLEN,
                           .linktype = 1};
-  pcap_write(&hdr, sizeof(hdr), 1, of);
+  iobuf = aligned_alloc(IO_BLOCK_SZ, RING_BLOCK_SZ);
+  iobuf_sz = 0;
+  memcpy(iobuf + iobuf_sz, &hdr, sizeof(hdr));
+  iobuf_sz += sizeof(hdr);
 }
+
 void save_packet(struct tpacket3_hdr *ppd) {
   struct pcap_phdr phdr = {0};
-  phdr.caplen = ppd->tp_snaplen;
+  phdr.caplen = (ppd->tp_snaplen > SNAPLEN) ? SNAPLEN : ppd->tp_snaplen;
   phdr.len = ppd->tp_snaplen;
   phdr.ts_sec = ppd->tp_sec;
   phdr.ts_usec = ppd->tp_nsec;
   // printf("tp_sec=%u tp_nsec=%u\n", ppd->tp_sec, ppd->tp_nsec);
-  pcap_write(&phdr, sizeof(phdr), 1, of);
-  pcap_write(((uint8_t *)ppd + ppd->tp_mac), ppd->tp_snaplen, 1, of);
+  memcpy(iobuf + iobuf_sz, &phdr, sizeof(phdr));
+  iobuf_sz += sizeof(phdr);
+  memcpy(iobuf + iobuf_sz, ((uint8_t *)ppd + ppd->tp_mac), phdr.caplen);
+  iobuf_sz += phdr.caplen;
 }
+
+void save_flush_block() {
+  int align = iobuf_sz / IO_BLOCK_SZ;
+  int rest = iobuf_sz % IO_BLOCK_SZ;
+  write(of, iobuf, align * IO_BLOCK_SZ);
+  memmove(iobuf, iobuf + align, rest);
+  iobuf_sz = rest;
+}
+
 void save_close() {
-  pcap_flush(of);
-  pcap_close(of);
+  save_flush_block();
+  if (iobuf_sz) {
+    close(of);
+    of = open(of_name, O_WRONLY | O_APPEND, 0644);
+    write(of, iobuf, iobuf_sz);
+    // fssync(of);
+  }
+  close(of);
+  free(iobuf);
 }
 
 #define next_packet(ptr, offset) ((pkthdr_t)((uint8_t *)(ptr) + (offset)))
@@ -213,6 +248,7 @@ static void walk_block(struct tpacket_block_desc *pbd) {
     save_packet(ppd);
     ppd = next_packet(ppd, ppd->tp_next_offset);
   }
+  save_flush_block();
   packets_total += num_pkts;
   bytes_total += bytes;
 }
@@ -230,7 +266,7 @@ static void teardown_socket(struct ring *ring, int fd) {
 
 static sig_atomic_t sigint = 0;
 static void sighandler(int num) { sigint = 1; }
-int blks = 0;
+int blks = 0, blklen = 0;
 static void read_cb(EV_P_ ev_io *w, int revents) {
   struct ring *ring = w->data;
   struct tpacket_block_desc *pbd;
@@ -244,6 +280,9 @@ static void read_cb(EV_P_ ev_io *w, int revents) {
     flush_block(pbd);
     ring->block_cur = (ring->block_cur + 1) % ring->block_cnt;
     blks++;
+    blklen += pbd->hdr.bh1.blk_len;
+    if (blks > 128)
+      break;
   }
   if (sigint)
     ev_break(EV_A_ EVBREAK_ALL);
@@ -262,12 +301,18 @@ static void stat_cb(EV_P_ ev_timer *w, int revents) {
     exit(1);
   }
 
-  printf("Received %u packets (%lu total),"
-         " %lu bytes (%lu total), %u dropped, freeze_q_cnt: %u, blks: %d\n",
-         stats.tp_packets, packets_total, bytes_total - bytes_last, bytes_total,
-         stats.tp_drops, stats.tp_freeze_q_cnt, blks);
+  uint64_t x = bytes_total - bytes_last;
+  double spd = x * 8 / 1024 / 1024 / 1024.0;
+  double bufutil = (blklen * 100.0) / (blks * RING_BLOCK_SZ);
+  fprintf(stderr,
+          "Received %u packets (%lu total),"
+          " %lu bytes %lf Gbps (%lu total), %u dropped, freeze_q_cnt: %u, "
+          "blks: %d , buffer util: %lf%%\n",
+          stats.tp_packets, packets_total, x, spd, bytes_total, stats.tp_drops,
+          stats.tp_freeze_q_cnt, blks, bufutil);
   bytes_last = bytes_total;
-  blks = 0;
+  blklen = blks = 0;
+  // syncfs(of);
 }
 
 int main(int argc, char **argp) {
